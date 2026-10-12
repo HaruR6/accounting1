@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <base target="_top">
+  <?!= include_('Styles'); ?>
+</head>
+<body>
+  <div id="dev-banner" class="dev-banner" hidden>ローカル検証モード · データは一時的なメモリ上に保存され、Googleには送信されません</div>
+  <header class="app-header">
+    <a href="#entry" class="brand" aria-label="まいにち家計簿 ホーム"><span class="brand-mark" aria-hidden="true">¥</span><span>まいにち<span class="brand-sub">家計簿</span></span></a>
+    <span class="private-label"><span aria-hidden="true">●</span> 自分だけの家計簿</span>
+  </header>
+  <main class="shell">
+    <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+    <div id="loading" class="loading" role="status">家計簿を読み込んでいます…</div>
+    <button id="reload-app" type="button" class="secondary" hidden>再読み込み</button>
+    <section id="entry" class="view" aria-labelledby="entry-title" hidden>
+      <div class="page-heading"><p class="eyebrow">DAILY RECORD</p><h1 id="entry-title">今日のお金を、記録する。</h1><p>小さな記録から、暮らしを見つめよう。</p></div>
+      <div class="entry-layout">
+        <form id="transaction-form" class="card entry-card">
+          <div id="edit-banner" class="edit-banner" hidden>取引を編集中 <button id="cancel-edit" type="button" class="text-button">キャンセル</button></div>
+          <fieldset id="entry-fields">
+            <legend class="sr-only">収支の入力</legend>
+            <div class="segmented" role="group" aria-label="収支区分">
+              <button type="button" data-type="expense" class="selected" aria-pressed="true">支出</button>
+              <button type="button" data-type="income" aria-pressed="false">収入</button>
+            </div>
+            <label class="field"><span>日付 <span class="required">必須</span></span><input id="entry-date" type="date" min="1900-01-01" max="9999-12-31" required></label>
+            <div class="field-pair">
+              <label class="field"><span><span id="payment-label">支払方法</span> <span class="required">必須</span></span><select id="entry-payment" required><option value="">選択してください</option></select></label>
+              <label class="field"><span>カテゴリ <span class="required">必須</span></span><select id="entry-category" required><option value="">選択してください</option></select></label>
+            </div>
+            <label class="field"><span>金額 <span class="required">必須</span></span><span class="amount-input"><span aria-hidden="true">¥</span><input id="entry-amount" type="text" inputmode="numeric" autocomplete="off" placeholder="0" required aria-describedby="amount-help"></span></label>
+            <p id="amount-help" class="field-help">1円以上の整数を入力してください。</p>
+            <label class="field"><span>備考 <span class="optional">任意</span></span><textarea id="entry-note" rows="3" maxlength="10000" placeholder="何に使いましたか？"></textarea></label>
+          </fieldset>
+          <p id="pending-message" class="notice" hidden>保存結果を確認できませんでした。入力内容を保持しています。同じ内容で再試行すると重複登録を防げます。</p>
+          <p id="entry-error" class="inline-error" role="alert" hidden></p>
+          <button id="save-transaction" class="primary full-width" type="submit" disabled>記録する</button>
+        </form>
+        <aside class="entry-aside"><div class="decorative-coins" aria-hidden="true"><span>¥</span><span>¥</span><span>¥</span></div><h2>続けるほど、<br>暮らしが見えてくる。</h2><p>日々の収入と支出をひとつずつ。<br>記録はあなたのスプレッドシートに。</p><button type="button" class="text-button" data-go="dashboard">今月の集計を見る →</button></aside>
+      </div>
+    </section>
+
+    <section id="dashboard" class="view" aria-labelledby="dashboard-title" hidden>
+      <div class="page-heading heading-row"><div><p class="eyebrow">MONTHLY REPORT</p><h1 id="dashboard-title">お金の流れを、見渡す。</h1><p>収入と支出を振り返る、月ごとの記録。</p></div><label class="month-control">対象月<input id="dashboard-month" type="month" min="1900-01" max="9999-12" required></label></div>
+      <div id="dashboard-content" aria-busy="false">
+        <div class="summary-grid"><article class="card summary"><h2>収入</h2><p id="summary-income">—</p><span>今月入ってきたお金</span></article><article class="card summary"><h2>支出</h2><p id="summary-expense">—</p><span>今月使ったお金</span></article><article class="card summary balance-card"><h2>収支差額</h2><p id="summary-balance">—</p><span>収入 − 支出</span></article></div>
+        <p class="balance-note">収支差額は、口座残高・資産残高を表すものではありません。</p>
+        <div class="chart-grid"><article class="card chart-card"><h2>カテゴリ別の支出</h2><p class="muted">何に使ったか、ひと目で。</p><div id="category-chart"></div><ul id="category-legend" class="category-legend"></ul></article><article class="card chart-card"><h2>12か月のお金の流れ</h2><p class="muted">選択月までの収入と支出を比較。</p><div class="chart-key"><span><i class="income-dot"></i>収入</span><span><i class="expense-dot"></i>支出</span></div><div id="trend-chart"></div><details class="trend-details"><summary>月ごとの金額を表示</summary><div id="trend-table"></div></details></article></div>
+      </div>
+    </section>
+
+    <section id="history" class="view" aria-labelledby="history-title" hidden>
+      <div class="page-heading"><p class="eyebrow">YOUR HISTORY</p><h1 id="history-title">これまでの記録。</h1><p>見返す、直す、これからにつなげる。</p></div>
+      <form id="history-filters" class="card filter-card"><label class="field">対象月<input id="history-month" type="month" min="1900-01" max="9999-12"></label><label class="field">収支区分<select id="history-type"><option value="">すべて</option><option value="expense">支出</option><option value="income">収入</option></select></label><label class="field">カテゴリ<select id="history-category"><option value="">すべて</option></select></label><button type="submit" class="secondary">絞り込む</button></form>
+      <div class="history-caption"><span id="history-count">—</span><button id="history-refresh" type="button" class="text-button">更新</button></div>
+      <div id="history-list" class="history-list" aria-busy="false"></div>
+      <div class="pagination"><button id="previous-page" type="button" class="secondary" disabled>← 前へ</button><span id="page-label"></span><button id="next-page" type="button" class="secondary" disabled>次へ →</button></div>
+    </section>
+
+    <section id="settings" class="view" aria-labelledby="settings-title" hidden>
+      <div class="page-heading"><p class="eyebrow">MAKE IT YOURS</p><h1 id="settings-title">自分に合う、家計簿に。</h1><p>名前や並び順を、使いやすく整えよう。</p></div>
+      <p class="notice">使用停止した項目は新規入力に表示されません。過去の記録と集計は保持されます。表示順は小さい数字から並びます。</p>
+      <div class="settings-grid"><article class="card settings-card"><div class="section-heading"><h2>支払・入金方法</h2><button type="button" class="secondary small" data-add="payment">＋ 追加</button></div><ul id="payment-settings" class="master-list"></ul></article><article class="card settings-card"><div class="section-heading"><h2>カテゴリ</h2><button type="button" class="secondary small" data-add="category">＋ 追加</button></div><label class="field">収支区分<select id="settings-type"><option value="expense">支出</option><option value="income">収入</option></select></label><ul id="category-settings" class="master-list"></ul></article></div>
+    </section>
+  </main>
+  <nav class="main-nav" aria-label="メインメニュー"><a href="#entry" data-view="entry" aria-current="page"><span aria-hidden="true">＋</span>記録</a><a href="#dashboard" data-view="dashboard"><span aria-hidden="true">▥</span>集計</a><a href="#history" data-view="history"><span aria-hidden="true">≡</span>履歴</a><a href="#settings" data-view="settings"><span aria-hidden="true">⚙</span>設定</a></nav>
+  <dialog id="master-dialog" aria-labelledby="master-title"><form id="master-form"><div class="section-heading"><h2 id="master-title">設定を追加</h2><button id="close-master" type="button" class="icon-button" aria-label="閉じる">×</button></div><fieldset id="master-fields"><legend class="sr-only">設定項目</legend><label id="master-type-field" class="field">収支区分<select id="master-type"><option value="expense">支出</option><option value="income">収入</option></select></label><label class="field">名称<input id="master-name" type="text" maxlength="100" required></label><label class="field">表示順<input id="master-order" type="number" min="0" max="1000000" step="1" required></label><label class="checkbox-label"><input id="master-active" type="checkbox" checked>使用する</label></fieldset><p id="master-error" class="inline-error" role="alert" hidden></p><p id="master-pending" class="notice" hidden>保存結果が不明です。同じ内容で再試行してください。</p><button id="save-master" type="submit" class="primary full-width">保存する</button></form></dialog>
+  <dialog id="delete-dialog" aria-labelledby="delete-title"><h2 id="delete-title">この記録を削除しますか？</h2><p>履歴と集計から除外します。スプレッドシート上の元データは残ります。</p><p id="delete-description"></p><p id="delete-error" class="inline-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-delete" type="button" class="secondary">キャンセル</button><button id="confirm-delete" type="button" class="danger">削除する</button></div></dialog>
+  <?!= include_('JavaScript'); ?>
+</body>
+</html>

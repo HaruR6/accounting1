@@ -1,0 +1,473 @@
+<script>
+'use strict';
+(() => {
+  const $ = id => document.getElementById(id);
+  const state = { methods: [], categories: [], type: 'expense', editing: null, entryBusy: false, pendingEntry: null, lastEntry: null, master: null, pendingMaster: null, masterBusy: false, deletion: null, deleteBusy: false, page: 1, pages: 1, historySeq: 0, dashboardSeq: 0, ready: false };
+  const yen = value => new Intl.NumberFormat('ja-JP').format(value) + '円';
+  const number = value => new Intl.NumberFormat('ja-JP').format(value);
+  const colors = ['#36765a', '#93af77', '#d5b16b', '#759da0', '#bd8979', '#aaa1ba', '#b7c7a1', '#74847b', '#d7c995', '#91a3ba', '#cda5ac', '#80946a'];
+  const entryStorage = 'accounting1.pendingEntry.v1';
+  const masterStorage = 'accounting1.pendingMaster.v1';
+
+  function node(tag, className, text) {
+    const item = document.createElement(tag);
+    if (className) item.className = className;
+    if (text !== undefined) item.textContent = text;
+    return item;
+  }
+  function svg(tag, attrs, text) {
+    const item = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    Object.entries(attrs || {}).forEach(([key, value]) => item.setAttribute(key, String(value)));
+    if (text !== undefined) item.textContent = text;
+    return item;
+  }
+  function message(text, error = false) {
+    $('status').textContent = text;
+    $('status').classList.toggle('error', error);
+    $('status').hidden = !text;
+  }
+  function inline(id, text) { $(id).textContent = text; $(id).hidden = !text; }
+  function storageRead(key) { try { return JSON.parse(sessionStorage.getItem(key)); } catch (_) { return null; } }
+  function storageWrite(key, value) {
+    try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); }
+    catch (_) { message('ブラウザが一時保存を許可していません。保存結果の確認が終わるまで、この画面を閉じないでください。', true); }
+  }
+  function uuid() {
+    if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  }
+  function todayTokyo() {
+    const p = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+    const get = kind => p.find(item => item.type === kind).value;
+    return `${get('year')}-${get('month')}-${get('day')}`;
+  }
+  function rpc(method, argument) {
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const timer = setTimeout(() => finish(new Error('通信の応答がありません。保存結果が不明なため、同じ内容で再試行してください。')), 45000);
+      function finish(error, data) {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        if (error) reject(error); else resolve(data);
+      }
+      try {
+        const runner = google.script.run.withSuccessHandler(result => {
+          if (result?.ok) finish(null, result.data);
+          else {
+            const error = new Error(result?.error?.message || '処理結果を確認できませんでした。');
+            error.code = result?.error?.code;
+            error.definitive = result?.ok === false && result.error?.retryable === false;
+            finish(error);
+          }
+        }).withFailureHandler(() => finish(new Error('Googleとの通信に失敗しました。時間をおいて再試行してください。')));
+        if (argument === undefined) runner[method](); else runner[method](argument);
+      } catch (_) { finish(new Error('接続を開始できませんでした。ページを読み直してください。')); }
+    });
+  }
+
+  function fillSelect(id, items, idKey, selected, label, inactiveId) {
+    const select = $(id);
+    select.replaceChildren(node('option', '', label));
+    select.firstChild.value = '';
+    items.forEach(item => {
+      if (!item.is_active && item[idKey] !== inactiveId) return;
+      const option = node('option', '', item.name + (!item.is_active ? '（使用停止中）' : ''));
+      option.value = item[idKey];
+      select.append(option);
+    });
+    select.value = selected || '';
+  }
+  function renderEntryOptions() {
+    const payment = $('entry-payment').value;
+    const category = $('entry-category').value;
+    fillSelect('entry-payment', state.methods, 'payment_method_id', payment, '選択してください', state.pendingEntry?.payload.payment_method_id || state.editing?.payment_method_id);
+    const categories = state.categories.filter(c => c.type === state.type);
+    fillSelect('entry-category', categories, 'category_id', category, '選択してください', state.pendingEntry?.payload.category_id || (state.editing?.type === state.type ? state.editing.category_id : undefined));
+    $('payment-label').textContent = state.type === 'income' ? '入金先' : '支払方法';
+    document.querySelectorAll('[data-type]').forEach(button => {
+      button.classList.toggle('selected', button.dataset.type === state.type);
+      button.setAttribute('aria-pressed', String(button.dataset.type === state.type));
+    });
+  }
+  function amountValue() {
+    const text = $('entry-amount').value;
+    if (!/^(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)$/.test(text)) return NaN;
+    return Number(text.replaceAll(',', ''));
+  }
+  function entryValid() {
+    return $('entry-date').value && $('entry-date').checkValidity() && $('entry-payment').value && $('entry-category').value && Number.isSafeInteger(amountValue()) && amountValue() >= 1 && $('entry-note').value.length <= 10000;
+  }
+  function updateEntryButton() {
+    $('entry-fields').disabled = state.entryBusy || !!state.pendingEntry;
+    $('cancel-edit').disabled = state.entryBusy || !!state.pendingEntry;
+    $('save-transaction').disabled = state.entryBusy || !state.ready || (!state.pendingEntry && !entryValid());
+    $('save-transaction').textContent = state.entryBusy ? '保存しています…' : state.pendingEntry ? '同じ内容で再試行' : state.editing ? '変更を保存する' : '記録する';
+    $('pending-message').hidden = !state.pendingEntry || state.entryBusy;
+  }
+  function resetEntry() {
+    state.editing = null;
+    state.type = 'expense';
+    state.pendingEntry = null;
+    state.lastEntry = null;
+    storageWrite(entryStorage, null);
+    $('transaction-form').reset();
+    $('entry-amount').setCustomValidity('');
+    $('entry-date').value = todayTokyo();
+    $('edit-banner').hidden = true;
+    inline('entry-error', '');
+    renderEntryOptions();
+    updateEntryButton();
+  }
+  function restoreEntry(pending) {
+    if (!pending?.payload || !['createTransaction', 'updateTransaction'].includes(pending.method)) return;
+    state.pendingEntry = pending;
+    state.editing = pending.editing || null;
+    state.type = pending.payload.type;
+    if (pending.method === 'createTransaction') state.lastEntry = { signature: entrySignature(pending.payload), request_id: pending.payload.request_id };
+    renderEntryOptions();
+    $('entry-date').value = pending.payload.date;
+    $('entry-payment').value = pending.payload.payment_method_id;
+    $('entry-category').value = pending.payload.category_id;
+    $('entry-amount').value = number(pending.payload.amount);
+    $('entry-amount').setCustomValidity('');
+    $('entry-note').value = pending.payload.note;
+    $('edit-banner').hidden = !state.editing;
+    updateEntryButton();
+  }
+  async function saveEntry(event) {
+    event.preventDefault();
+    if (state.entryBusy || (!state.pendingEntry && !entryValid())) return;
+    if (!state.pendingEntry) {
+      const payload = { date: $('entry-date').value, type: state.type, payment_method_id: $('entry-payment').value, category_id: $('entry-category').value, amount: amountValue(), note: $('entry-note').value };
+      if (state.editing) Object.assign(payload, { transaction_id: state.editing.transaction_id, expected_updated_at: state.editing.updated_at });
+      else {
+        const signature = entrySignature(payload);
+        payload.request_id = state.lastEntry?.signature === signature ? state.lastEntry.request_id : uuid();
+        state.lastEntry = { signature, request_id: payload.request_id };
+      }
+      state.pendingEntry = { method: state.editing ? 'updateTransaction' : 'createTransaction', payload, editing: state.editing };
+      storageWrite(entryStorage, state.pendingEntry);
+    }
+    state.entryBusy = true;
+    updateEntryButton();
+    inline('entry-error', '');
+    let saved = false;
+    const wasEdit = !!state.editing;
+    try {
+      await rpc(state.pendingEntry.method, state.pendingEntry.payload);
+      saved = true;
+      resetEntry();
+      message(wasEdit ? '記録を更新しました。' : '記録しました。');
+    } catch (error) {
+      if (error.definitive) { state.pendingEntry = null; storageWrite(entryStorage, null); }
+      inline('entry-error', error.message);
+    } finally { state.entryBusy = false; updateEntryButton(); }
+    if (saved) {
+      await refreshAfterSave();
+      if (wasEdit) navigate('history');
+    }
+  }
+  function editTransaction(row) {
+    if (state.pendingEntry || state.entryBusy) { message('先に入力画面で保存結果を確認してください。', true); return; }
+    state.editing = row;
+    state.type = row.type;
+    renderEntryOptions();
+    $('entry-date').value = row.date;
+    $('entry-payment').value = row.payment_method_id;
+    $('entry-category').value = row.category_id;
+    $('entry-amount').value = number(row.amount);
+    $('entry-amount').setCustomValidity('');
+    $('entry-note').value = row.note;
+    $('edit-banner').hidden = false;
+    inline('entry-error', '');
+    updateEntryButton();
+    navigate('entry');
+  }
+
+  function entrySignature(payload) { return JSON.stringify(['date', 'type', 'payment_method_id', 'category_id', 'amount', 'note'].map(key => payload[key])); }
+
+  function renderDonut(data) {
+    const target = $('category-chart');
+    const legend = $('category-legend');
+    target.replaceChildren(); legend.replaceChildren();
+    if (!data.categories.length) { target.append(node('p', 'empty', 'データがありません')); return; }
+    const chart = svg('svg', { viewBox: '0 0 220 220', class: 'donut', role: 'img', 'aria-label': `カテゴリ別支出 合計${yen(data.expense)}` });
+    const radius = 79, circumference = 2 * Math.PI * radius;
+    let offset = 0;
+    data.categories.forEach((item, i) => {
+      const color = colors[i % colors.length];
+      const arc = svg('circle', { cx: 110, cy: 110, r: radius, fill: 'none', stroke: color, 'stroke-width': 24, 'stroke-dasharray': `${item.ratio * circumference} ${circumference}`, 'stroke-dashoffset': -offset, transform: 'rotate(-90 110 110)' });
+      arc.append(svg('title', {}, `${item.name}：${yen(item.amount)}（${(item.ratio * 100).toFixed(1)}%）`));
+      chart.append(arc);
+      offset += item.ratio * circumference;
+      const li = node('li');
+      const dot = node('i', 'legend-dot'); dot.style.backgroundColor = color;
+      li.append(dot, node('span', '', item.name), node('span', '', yen(item.amount)), node('span', '', (item.ratio * 100).toFixed(1) + '%'));
+      legend.append(li);
+    });
+    chart.append(svg('text', { x: 110, y: 102, 'text-anchor': 'middle', 'font-size': 11 }, '支出合計'), svg('text', { x: 110, y: 127, 'text-anchor': 'middle', 'font-size': data.expense > 99999999 ? 12 : 18, 'font-weight': 600 }, yen(data.expense)));
+    target.append(chart);
+  }
+  function renderTrend(months) {
+    const target = $('trend-chart'); target.replaceChildren();
+    const max = Math.max(1, ...months.flatMap(m => [m.income, m.expense]));
+    const chart = svg('svg', { viewBox: '0 0 470 245', class: 'trend-svg', role: 'img', 'aria-label': '直近12か月の収入・支出。金額は下の表で確認できます。' });
+    const left = 52, top = 28, width = 407, height = 158;
+    for (let i = 0; i <= 4; i++) {
+      const y = top + height * i / 4;
+      chart.append(svg('line', { x1: left, x2: left + width, y1: y, y2: y, stroke: '#e5e9e1', 'stroke-width': 1 }));
+      const amount = max * (1 - i / 4);
+      const label = amount >= 100000000 ? (amount / 100000000).toFixed(1) + '億' : amount >= 10000 ? (amount / 10000).toFixed(1) + '万' : number(Math.round(amount));
+      chart.append(svg('text', { x: left - 7, y: y + 3, 'text-anchor': 'end' }, label));
+    }
+    chart.append(svg('text', { x: 7, y: 13 }, '円'));
+    months.forEach((month, i) => {
+      const x = left + i * width / 12 + 5;
+      ['income', 'expense'].forEach((kind, j) => {
+        const h = month[kind] / max * height;
+        const bar = svg('rect', { x: x + j * 11, y: top + height - h, width: 9, height: h, rx: 2, fill: kind === 'income' ? '#86aa8e' : '#d1a66b' });
+        bar.append(svg('title', {}, `${month.month} ${kind === 'income' ? '収入' : '支出'}：${yen(month[kind])}`)); chart.append(bar);
+      });
+      chart.append(svg('text', { x: x + 10, y: top + height + 20, 'text-anchor': 'middle' }, Number(month.month.slice(5)) + '月'));
+      if (i === 0 || month.month.endsWith('-01')) chart.append(svg('text', { x: x + 10, y: top + height + 38, 'text-anchor': 'middle' }, month.month.slice(0, 4)));
+    });
+    target.append(chart);
+    if (months.every(m => !m.income && !m.expense)) target.append(node('p', 'muted', 'この12か月にはデータがありません。'));
+    const table = node('table'), head = node('thead'), header = node('tr'), body = node('tbody');
+    ['年月', '収入', '支出'].forEach(label => { const th = node('th', '', label); th.scope = 'col'; header.append(th); });
+    head.append(header);
+    months.forEach(month => { const tr = node('tr'); tr.append(node('td', '', month.month), node('td', '', yen(month.income)), node('td', '', yen(month.expense))); body.append(tr); });
+    table.append(head, body); $('trend-table').replaceChildren(table);
+  }
+  async function loadDashboard() {
+    const month = $('dashboard-month').value;
+    if (!month || !$('dashboard-month').checkValidity()) { message('有効な対象月を選んでください。', true); return; }
+    const seq = ++state.dashboardSeq;
+    $('dashboard-content').setAttribute('aria-busy', 'true');
+    // Clear stale totals so a failed request cannot show another month's amounts.
+    ['income', 'expense', 'balance'].forEach(key => $('summary-' + key).textContent = '—');
+    $('category-chart').replaceChildren(node('p', 'empty', '読み込み中…'));
+    $('category-legend').replaceChildren(); $('trend-chart').replaceChildren(); $('trend-table').replaceChildren();
+    try {
+      const data = await rpc('getDashboard', month);
+      if (seq !== state.dashboardSeq) return;
+      $('summary-income').textContent = yen(data.income); $('summary-expense').textContent = yen(data.expense); $('summary-balance').textContent = yen(data.balance);
+      renderDonut(data); renderTrend(data.months);
+    } catch (error) {
+      if (seq === state.dashboardSeq) { $('category-chart').replaceChildren(node('p', 'empty', '読み込めませんでした。対象月を選び直して再試行してください。')); message(error.message, true); }
+    } finally { if (seq === state.dashboardSeq) $('dashboard-content').setAttribute('aria-busy', 'false'); }
+  }
+
+  function renderHistoryCategories() {
+    const previous = $('history-category').value, type = $('history-type').value;
+    const select = $('history-category'); select.replaceChildren(node('option', '', 'すべて')); select.firstChild.value = '';
+    state.categories.filter(c => !type || c.type === type).forEach(category => {
+      const option = node('option', '', category.name + (!type ? `（${category.type === 'income' ? '収入' : '支出'}）` : '') + (!category.is_active ? '・使用停止' : ''));
+      option.value = category.category_id; select.append(option);
+    });
+    select.value = previous;
+  }
+  async function loadHistory(page = 1) {
+    const filter = { month: $('history-month').value, type: $('history-type').value, category_id: $('history-category').value, page };
+    if (filter.month && !$('history-month').checkValidity()) { message('有効な対象月を選んでください。', true); return; }
+    const seq = ++state.historySeq;
+    $('history-list').setAttribute('aria-busy', 'true');
+    $('history-list').replaceChildren(node('p', 'empty', '読み込み中…'));
+    $('history-count').textContent = '—'; $('page-label').textContent = '';
+    $('previous-page').disabled = true; $('next-page').disabled = true;
+    try {
+      const result = await rpc('listTransactions', filter);
+      if (seq !== state.historySeq) return;
+      state.page = result.page; state.pages = result.pages;
+      $('history-count').textContent = `${result.total}件の記録`;
+      $('page-label').textContent = `${result.page} / ${result.pages}`;
+      $('previous-page').disabled = result.page <= 1; $('next-page').disabled = result.page >= result.pages;
+      const list = $('history-list'); list.replaceChildren();
+      if (!result.items.length) list.append(node('p', 'empty card', 'この条件の記録はありません。'));
+      result.items.forEach(row => {
+        const article = node('article', 'card transaction-row');
+        const left = node('div'), right = node('div', 'row-right');
+        left.append(node('p', 'row-date', row.date.replaceAll('-', ' / ') + ' · ' + (row.type === 'income' ? '収入' : '支出')), node('h2', 'row-title', row.category_name), node('p', 'row-method', row.payment_method_name));
+        if (row.note) left.append(node('p', 'row-note', row.note));
+        right.append(node('p', 'row-amount ' + row.type, (row.type === 'income' ? '+' : '−') + yen(row.amount)));
+        const actions = node('div', 'row-actions');
+        const edit = node('button', 'text-button', '編集'); edit.type = 'button'; edit.addEventListener('click', () => editTransaction(row));
+        const remove = node('button', 'text-button delete-text', '削除'); remove.type = 'button'; remove.addEventListener('click', () => openDelete(row));
+        actions.append(edit, remove); right.append(actions); article.append(left, right); list.append(article);
+      });
+    } catch (error) { if (seq === state.historySeq) { $('history-list').replaceChildren(node('p', 'empty', '読み込めませんでした。「更新」で再試行してください。')); message(error.message, true); } }
+    finally { if (seq === state.historySeq) $('history-list').setAttribute('aria-busy', 'false'); }
+  }
+  function openDelete(row) {
+    state.deletion = row;
+    $('delete-description').textContent = `${row.date} / ${row.category_name} / ${yen(row.amount)}`;
+    inline('delete-error', ''); $('delete-dialog').showModal();
+  }
+  async function confirmDelete() {
+    if (state.deleteBusy || !state.deletion) return;
+    state.deleteBusy = true; $('confirm-delete').disabled = true; $('cancel-delete').disabled = true;
+    inline('delete-error', '');
+    let saved = false;
+    try {
+      await rpc('deleteTransaction', { transaction_id: state.deletion.transaction_id, expected_updated_at: state.deletion.updated_at });
+      saved = true; $('delete-dialog').close(); state.deletion = null; message('記録を削除しました。');
+    } catch (error) { inline('delete-error', error.message); }
+    finally { state.deleteBusy = false; $('confirm-delete').disabled = false; $('cancel-delete').disabled = false; }
+    if (saved) await loadHistory(state.page);
+  }
+
+  function renderSettings() {
+    function render(id, items, kind) {
+      const list = $(id); list.replaceChildren();
+      items.forEach(item => {
+        const li = node('li', item.is_active ? '' : 'inactive'), text = node('div');
+        text.append(node('strong', '', item.name), node('small', '', `表示順 ${item.sort_order} · ${item.is_active ? '使用中' : '使用停止中'}`));
+        const edit = node('button', 'text-button', '編集'); edit.type = 'button'; edit.addEventListener('click', () => openMaster(kind, item));
+        li.append(text, edit); list.append(li);
+      });
+    }
+    render('payment-settings', state.methods, 'payment');
+    render('category-settings', state.categories.filter(c => c.type === $('settings-type').value), 'category');
+  }
+  function setMasterState() {
+    $('master-fields').disabled = state.masterBusy || !!state.pendingMaster;
+    $('master-type').disabled = !!state.master?.item || state.masterBusy || !!state.pendingMaster;
+    $('close-master').disabled = state.masterBusy || !!state.pendingMaster;
+    $('save-master').disabled = state.masterBusy;
+    $('save-master').textContent = state.masterBusy ? '保存しています…' : state.pendingMaster ? '同じ内容で再試行' : '保存する';
+    $('master-pending').hidden = !state.pendingMaster || state.masterBusy;
+  }
+  function openMaster(kind, item = null) {
+    if (state.pendingMaster || state.masterBusy) { $('master-dialog').showModal(); return; }
+    state.master = { kind, item };
+    const items = kind === 'payment' ? state.methods : state.categories.filter(c => c.type === $('settings-type').value);
+    $('master-title').textContent = `${kind === 'payment' ? '支払・入金方法' : 'カテゴリ'}を${item ? '編集' : '追加'}`;
+    $('master-type-field').hidden = kind !== 'category';
+    $('master-type').value = item?.type || $('settings-type').value;
+    $('master-name').value = item?.name || '';
+    $('master-order').value = item?.sort_order ?? Math.min(1000000, Math.max(0, ...items.map(m => m.sort_order)) + 10);
+    $('master-active').checked = item ? item.is_active : true;
+    inline('master-error', ''); setMasterState(); $('master-dialog').showModal();
+  }
+  async function saveMaster(event) {
+    event.preventDefault();
+    if (state.masterBusy) return;
+    if (!state.pendingMaster) {
+      if (!$('master-form').reportValidity()) return;
+      const payload = { name: $('master-name').value.trim(), sort_order: Number($('master-order').value), is_active: $('master-active').checked };
+      const { kind, item } = state.master;
+      if (kind === 'category') payload.type = item?.type || $('master-type').value;
+      if (item) { payload[kind === 'payment' ? 'payment_method_id' : 'category_id'] = item[kind === 'payment' ? 'payment_method_id' : 'category_id']; payload.expected_updated_at = item.updated_at; }
+      else payload.request_id = uuid();
+      state.pendingMaster = { method: kind === 'payment' ? 'savePaymentMethod' : 'saveCategory', payload, master: state.master };
+      storageWrite(masterStorage, state.pendingMaster);
+    }
+    state.masterBusy = true; setMasterState(); inline('master-error', '');
+    let saved = false;
+    try {
+      await rpc(state.pendingMaster.method, state.pendingMaster.payload);
+      saved = true; state.pendingMaster = null; storageWrite(masterStorage, null); $('master-dialog').close(); message('設定を保存しました。');
+    } catch (error) {
+      if (error.definitive) { state.pendingMaster = null; storageWrite(masterStorage, null); }
+      inline('master-error', error.message);
+    } finally { state.masterBusy = false; setMasterState(); }
+    if (saved) await refreshAfterSave();
+  }
+
+  async function loadBootstrap() {
+    const data = await rpc('getBootstrap');
+    state.methods = data.paymentMethods; state.categories = data.categories;
+    renderEntryOptions(); renderHistoryCategories(); renderSettings(); updateEntryButton();
+    return data;
+  }
+  async function refreshAfterSave() {
+    try { await loadBootstrap(); }
+    catch (error) { message(`保存は完了しましたが、最新の設定を読み込めませんでした。${error.message}`, true); }
+    const view = location.hash.slice(1);
+    if (view === 'dashboard') await loadDashboard();
+    if (view === 'history') await loadHistory(state.page);
+  }
+  function navigate(view) {
+    if (!['entry', 'dashboard', 'history', 'settings'].includes(view)) view = 'entry';
+    if (location.hash !== '#' + view) location.hash = view;
+    else showView();
+  }
+  function showView() {
+    if (!state.ready) return;
+    const requested = location.hash.slice(1);
+    const view = ['entry', 'dashboard', 'history', 'settings'].includes(requested) ? requested : 'entry';
+    document.querySelectorAll('.view').forEach(section => section.hidden = section.id !== view);
+    document.querySelectorAll('[data-view]').forEach(link => { if (link.dataset.view === view) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
+    if (view === 'dashboard') loadDashboard();
+    if (view === 'history') loadHistory();
+    if (view === 'settings') renderSettings();
+    window.scrollTo({ top: 0 });
+  }
+  async function start() {
+    $('loading').hidden = false; $('reload-app').hidden = true;
+    try {
+      await loadBootstrap(); state.ready = true;
+      const today = todayTokyo(); $('entry-date').value = today;
+      $('dashboard-month').value = today.slice(0, 7); $('history-month').value = today.slice(0, 7);
+      restoreEntry(storageRead(entryStorage)); updateEntryButton();
+      $('loading').hidden = true; showView();
+      const pending = storageRead(masterStorage);
+      if (pending?.payload && ['saveCategory', 'savePaymentMethod'].includes(pending.method)) {
+        openMaster(pending.master.kind, pending.master.item);
+        state.pendingMaster = pending; state.master = pending.master;
+        $('master-name').value = pending.payload.name; $('master-order').value = pending.payload.sort_order; $('master-active').checked = pending.payload.is_active;
+        if (pending.payload.type) $('master-type').value = pending.payload.type;
+        setMasterState();
+      }
+    } catch (error) { $('loading').hidden = true; $('reload-app').hidden = false; message(error.message, true); }
+  }
+  document.querySelectorAll('[data-type]').forEach(button => button.addEventListener('click', () => {
+    if (state.pendingEntry || state.entryBusy) return;
+    state.type = button.dataset.type; $('entry-category').value = ''; renderEntryOptions(); updateEntryButton();
+  }));
+  $('transaction-form').addEventListener('submit', saveEntry);
+  $('transaction-form').addEventListener('input', updateEntryButton);
+  $('transaction-form').addEventListener('change', updateEntryButton);
+  $('entry-amount').addEventListener('input', () => {
+    const input = $('entry-amount');
+    const value = amountValue();
+    const caret = input.selectionStart;
+    const remaining = input.value.length - caret;
+    if (Number.isSafeInteger(value) && value >= 0) {
+      input.value = number(value);
+      const newCaret = Math.max(0, input.value.length - remaining);
+      input.setSelectionRange(newCaret, newCaret);
+    }
+    input.setCustomValidity(input.value && (!Number.isSafeInteger(amountValue()) || amountValue() < 1) ? '1円以上の整数で入力してください。' : '');
+    updateEntryButton();
+  });
+  $('cancel-edit').addEventListener('click', () => { resetEntry(); navigate('history'); });
+  $('history-filters').addEventListener('submit', event => { event.preventDefault(); loadHistory(); });
+  $('history-type').addEventListener('change', renderHistoryCategories);
+  $('history-refresh').addEventListener('click', () => loadHistory(state.page));
+  $('previous-page').addEventListener('click', () => loadHistory(state.page - 1));
+  $('next-page').addEventListener('click', () => loadHistory(state.page + 1));
+  $('dashboard-month').addEventListener('change', loadDashboard);
+  $('settings-type').addEventListener('change', renderSettings);
+  document.querySelectorAll('[data-add]').forEach(button => button.addEventListener('click', () => openMaster(button.dataset.add)));
+  document.querySelectorAll('[data-go]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.go)));
+  // GAS runs inside an iframe. Keep navigation in this app despite base target=_top.
+  document.querySelectorAll('[data-view]').forEach(link => link.addEventListener('click', event => { event.preventDefault(); navigate(link.dataset.view); }));
+  document.querySelector('.brand').addEventListener('click', event => { event.preventDefault(); navigate('entry'); });
+  $('master-form').addEventListener('submit', saveMaster);
+  $('close-master').addEventListener('click', () => $('master-dialog').close());
+  $('master-dialog').addEventListener('cancel', event => { if (state.masterBusy || state.pendingMaster) event.preventDefault(); });
+  $('cancel-delete').addEventListener('click', () => $('delete-dialog').close());
+  $('delete-dialog').addEventListener('cancel', event => { if (state.deleteBusy) event.preventDefault(); });
+  $('confirm-delete').addEventListener('click', confirmDelete);
+  $('reload-app').addEventListener('click', start);
+  window.addEventListener('hashchange', showView);
+  window.addEventListener('beforeunload', event => {
+    if (state.pendingEntry || state.pendingMaster || state.deleteBusy) { event.preventDefault(); event.returnValue = ''; }
+  });
+  start();
+})();
+</script>

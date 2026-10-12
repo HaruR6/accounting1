@@ -1,0 +1,10 @@
+const fs = require('node:fs');
+const vm = require('node:vm');
+const path = require('node:path');
+const root = path.join(__dirname, '..');
+new vm.Script(fs.readFileSync(path.join(root, 'Code.gs'), 'utf8'), { filename: 'Code.gs' });
+const js = fs.readFileSync(path.join(root, 'JavaScript.html'), 'utf8');
+new vm.Script(js.replace(/^<script>\s*/, '').replace(/\s*<\/script>\s*$/, ''), { filename: 'JavaScript.html' });
+const manifest = JSON.parse(fs.readFileSync(path.join(root, 'appsscript.json'), 'utf8'));
+if (manifest.timeZone !== 'Asia/Tokyo' || manifest.runtimeVersion !== 'V8') throw new Error('Invalid Apps Script manifest');
+console.log('GAS / browser JavaScript syntax and manifest: OK');
