@@ -4,7 +4,7 @@ const path = require('node:path');
 const { createRuntime } = require('./gas-runtime.cjs');
 const root = path.join(__dirname, '..');
 const runtime = createRuntime();
-const allowed = new Set(['getBootstrap', 'createTransaction', 'updateTransaction', 'deleteTransaction', 'listTransactions', 'getDashboard', 'savePaymentMethod', 'saveCategory']);
+const allowed = new Set(['getBootstrap', 'createTransaction', 'updateTransaction', 'deleteTransaction', 'listTransactions', 'getDashboard', 'savePaymentMethod', 'saveCategory', 'initializeAssets', 'saveAssetBalances', 'getAssets', 'savePaymentAccountLink', 'createAssetMovement', 'deleteAssetMovement']);
 const shim = `<script>
 document.addEventListener('DOMContentLoaded', () => { document.getElementById('dev-banner').hidden = false; });
 window.google = { script: { get run() {

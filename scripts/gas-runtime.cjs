@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 
 class Sheet {
   constructor(name) { this.name = name; this.rows = []; this.formats = new Map(); this.formulas = new Map(); }
@@ -57,7 +57,7 @@ function createRuntime({ initialized = true } = {}) {
   const context = vm.createContext({
     Date,
     console: { error: value => runtime.errors.push(String(value)) },
-    Utilities: { getUuid: randomUUID, formatDate },
+    Utilities: { getUuid: randomUUID, formatDate, DigestAlgorithm: { SHA_256: 'SHA_256' }, computeDigest: (_algorithm, value) => Array.from(createHash('sha256').update(value).digest()) },
     Session: { getActiveUser: () => ({ getEmail: () => runtime.activeEmail }), getEffectiveUser: () => ({ getEmail: () => runtime.effectiveEmail }) },
     PropertiesService: { getScriptProperties: () => ({ getProperty: key => properties.get(key) || null, setProperty: (key, value) => properties.set(key, String(value)) }) },
     LockService: { getScriptLock: () => ({ tryLock: () => { if (runtime.busy || runtime.lockHeld) return false; runtime.lockHeld = true; runtime.lockCount++; return true; }, releaseLock: () => { runtime.lockHeld = false; } }) },

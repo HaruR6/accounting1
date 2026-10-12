@@ -8,6 +8,8 @@
   const colors = ['#36765a', '#93af77', '#d5b16b', '#759da0', '#bd8979', '#aaa1ba', '#b7c7a1', '#74847b', '#d7c995', '#91a3ba', '#cda5ac', '#80946a'];
   const entryStorage = 'accounting1.pendingEntry.v1';
   const masterStorage = 'accounting1.pendingMaster.v1';
+  const assetStorage = 'accounting1.pendingAsset.v1';
+  Object.assign(state, { accounts: [], paymentLinks: [], assetsInitialized: false, assets: null, assetSeq: 0, assetBusy: false, pendingAsset: null, balanceAccount: null, linkMethod: null });
 
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -92,10 +94,31 @@
       button.setAttribute('aria-pressed', String(button.dataset.type === state.type));
     });
   }
-  function amountValue() {
-    const text = $('entry-amount').value;
+  function moneyValue(input) {
+    const text = input.value;
     if (!/^(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)$/.test(text)) return NaN;
     return Number(text.replaceAll(',', ''));
+  }
+  function amountValue() { return moneyValue($('entry-amount')); }
+  function bindMoneyInput(input, min = 0) {
+    input.addEventListener('input', event => {
+      const raw = input.value;
+      // Digits appended to 1,234 temporarily form 1,2345: regroup after every edit.
+      // Malformed pasted comma strings, decimals and signs remain invalid.
+      const digitEdit = /^delete/.test(event.inputType || '') || /^[0-9]+$/.test(event.data || '');
+      const normalized = digitEdit && /^[0-9,]+$/.test(raw) ? raw.replaceAll(',', '') : raw;
+      const validText = /^(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)$/.test(normalized);
+      const value = validText ? Number(normalized.replaceAll(',', '')) : NaN;
+      const rightDigits = raw.slice(input.selectionStart ?? raw.length).replace(/[^0-9]/g, '').length;
+      if (Number.isSafeInteger(value) && value >= 0) {
+        input.value = number(value);
+        let caret = input.value.length, remaining = rightDigits;
+        while (caret > 0 && remaining > 0) { caret--; if (/[0-9]/.test(input.value[caret])) remaining--; }
+        input.setSelectionRange(caret, caret);
+      }
+      input.setCustomValidity(input.value && (!Number.isSafeInteger(moneyValue(input)) || moneyValue(input) < min) ? `${min}円以上の整数で入力してください。` : '');
+      updateEntryButton();
+    });
   }
   function entryValid() {
     return $('entry-date').value && $('entry-date').checkValidity() && $('entry-payment').value && $('entry-category').value && Number.isSafeInteger(amountValue()) && amountValue() >= 1 && $('entry-note').value.length <= 10000;
@@ -106,6 +129,11 @@
     $('save-transaction').disabled = state.entryBusy || !state.ready || (!state.pendingEntry && !entryValid());
     $('save-transaction').textContent = state.entryBusy ? '保存しています…' : state.pendingEntry ? '同じ内容で再試行' : state.editing ? '変更を保存する' : '記録する';
     $('pending-message').hidden = !state.pendingEntry || state.entryBusy;
+    const payment = $('entry-payment').value;
+    const link = state.paymentLinks.find(item => item.payment_method_id === payment);
+    const account = state.accounts.find(item => item.account_id === link?.account_id);
+    $('entry-link-help').hidden = !payment;
+    $('entry-link-help').textContent = account ? `残高反映先：${account.name}` : '残高反映先が未設定です。資産管理タブで設定してください。';
   }
   function resetEntry() {
     state.editing = null;
@@ -312,11 +340,12 @@
     inline('delete-error', '');
     let saved = false;
     try {
-      await rpc('deleteTransaction', { transaction_id: state.deletion.transaction_id, expected_updated_at: state.deletion.updated_at });
+      if (state.deletion.isMovement) await rpc('deleteAssetMovement', { movement_id: state.deletion.movement_id });
+      else await rpc('deleteTransaction', { transaction_id: state.deletion.transaction_id, expected_updated_at: state.deletion.updated_at });
       saved = true; $('delete-dialog').close(); state.deletion = null; message('記録を削除しました。');
     } catch (error) { inline('delete-error', error.message); }
     finally { state.deleteBusy = false; $('confirm-delete').disabled = false; $('cancel-delete').disabled = false; }
-    if (saved) await loadHistory(state.page);
+    if (saved) { if (location.hash === '#assets') await loadAssets(); else await loadHistory(state.page); }
   }
 
   function renderSettings() {
@@ -377,9 +406,206 @@
     if (saved) await refreshAfterSave();
   }
 
+  function prepareInitialFields() {
+    if ($('initial-assets').children.length) return;
+    state.accounts.forEach(account => {
+      const label = node('label', 'field', account.name);
+      const input = node('input'); input.id = 'initial-' + account.account_id; input.type = 'text'; input.inputMode = 'numeric'; input.required = true; input.value = '0';
+      bindMoneyInput(input); label.append(input);
+      $(account.kind === 'asset' ? 'initial-assets' : 'initial-liabilities').append(label);
+    });
+  }
+  function renderAssetLinks() {
+    const list = $('asset-links'); list.replaceChildren();
+    state.methods.forEach(method => {
+      const link = state.paymentLinks.find(l => l.payment_method_id === method.payment_method_id);
+      const account = state.accounts.find(a => a.account_id === link?.account_id);
+      const li = node('li'), text = node('div');
+      text.append(node('strong', '', method.name), node('small', '', '反映先：' + (account?.name || '未設定')));
+      const button = node('button', 'text-button', '変更'); button.type = 'button'; button.addEventListener('click', () => openLink(method));
+      li.append(text, button); list.append(li);
+    });
+  }
+  function assetControls() {
+    for (const form of ['initial', 'balance', 'movement', 'link']) {
+      const locked = state.assetBusy || state.pendingAsset?.form === form;
+      $(form === 'balance' ? 'balance-edit-fields' : form + '-fields').disabled = !!locked;
+      $('save-' + form).disabled = state.assetBusy;
+      $('save-' + form).textContent = state.assetBusy ? '保存しています…' : state.pendingAsset?.form === form ? '同じ内容で再試行' : form === 'initial' ? '開始残高を登録する' : form === 'movement' ? '登録する' : '保存する';
+      $(form + '-pending').hidden = state.pendingAsset?.form !== form || state.assetBusy;
+      if (form !== 'initial') $('close-' + form).disabled = !!locked;
+    }
+  }
+  async function assetSave(method, form, payload) {
+    if (state.assetBusy) return;
+    if (state.pendingAsset && state.pendingAsset.form !== form) { message('保存結果が不明な処理を先に再試行してください。', true); return; }
+    if (!state.pendingAsset) { state.pendingAsset = { method, form, payload }; storageWrite(assetStorage, state.pendingAsset); }
+    state.assetBusy = true; assetControls(); inline(form + '-error', '');
+    let saved = false;
+    try {
+      await rpc(state.pendingAsset.method, state.pendingAsset.payload);
+      saved = true; state.pendingAsset = null; storageWrite(assetStorage, null);
+      if (form !== 'initial') $(form + '-dialog').close();
+      message(form === 'initial' ? '開始残高を登録しました。' : form === 'movement' ? '資産移動・返済を登録しました。' : '残高設定を保存しました。');
+    } catch (error) {
+      if (error.definitive) { state.pendingAsset = null; storageWrite(assetStorage, null); }
+      inline(form + '-error', error.message);
+    } finally { state.assetBusy = false; assetControls(); }
+    if (saved) await refreshAfterSave();
+  }
+  function accountOptions(id, selected = '') {
+    const select = $(id); select.replaceChildren(node('option', '', '選択してください')); select.firstChild.value = '';
+    state.accounts.forEach(a => { const option = node('option', '', a.name + (a.kind === 'liability' ? '（負債）' : '')); option.value = a.account_id; select.append(option); });
+    select.value = selected;
+  }
+  function assetCanOpen() {
+    if (state.pendingAsset || state.assetBusy) { message('保存結果が不明な処理を先に再試行してください。', true); return false; }
+    return true;
+  }
+  function openBalance(account) {
+    if (!assetCanOpen()) return;
+    state.balanceAccount = account;
+    state.balanceRevision = state.assets.revision;
+    $('balance-title').textContent = account.name + 'の残高・評価額';
+    $('balance-date').value = state.assets.date; $('balance-date').max = todayTokyo();
+    $('balance-amount').value = number(account.amount); $('balance-amount').setCustomValidity('');
+    inline('balance-error', ''); assetControls(); $('balance-dialog').showModal();
+  }
+  function openMovement() {
+    if (!assetCanOpen()) return;
+    $('movement-form').reset(); $('movement-date').value = todayTokyo(); $('movement-date').max = todayTokyo();
+    accountOptions('movement-from'); accountOptions('movement-to'); $('movement-amount').setCustomValidity('');
+    inline('movement-error', ''); assetControls(); $('movement-dialog').showModal();
+  }
+  function openLink(method) {
+    if (!assetCanOpen()) return;
+    state.linkMethod = method;
+    const link = state.paymentLinks.find(l => l.payment_method_id === method.payment_method_id);
+    state.linkUpdatedAt = link?.updated_at || '';
+    $('link-title').textContent = method.name + 'の反映先';
+    accountOptions('link-account', link?.account_id);
+    inline('link-error', ''); assetControls(); $('link-dialog').showModal();
+  }
+  function restoreAssetPending(pending) {
+    const methods = { initial: 'initializeAssets', balance: 'saveAssetBalances', movement: 'createAssetMovement', link: 'savePaymentAccountLink' };
+    if (!pending?.payload || methods[pending.form] !== pending.method) return;
+    state.pendingAsset = pending;
+    location.hash = 'assets';
+    const p = pending.payload;
+    if (pending.form === 'initial') {
+      $('initial-date').value = p.date;
+      state.accounts.forEach(a => { $('initial-' + a.account_id).value = number(p.balances[a.account_id]); });
+    } else if (pending.form === 'balance') {
+      const id = Object.keys(p.balances)[0]; state.balanceAccount = state.accounts.find(a => a.account_id === id);
+      $('balance-title').textContent = (state.balanceAccount?.name || '') + 'の残高・評価額';
+      $('balance-date').value = p.date; $('balance-amount').value = number(p.balances[id]);
+      $('balance-dialog').showModal();
+    } else if (pending.form === 'movement') {
+      $('movement-date').value = p.date; accountOptions('movement-from', p.from_account_id); accountOptions('movement-to', p.to_account_id); $('movement-amount').value = number(p.amount);
+      $('movement-dialog').showModal();
+    } else {
+      state.linkMethod = state.methods.find(m => m.payment_method_id === p.payment_method_id); accountOptions('link-account', p.account_id); $('link-dialog').showModal();
+    }
+    assetControls();
+  }
+  function renderAccountBalances(data) {
+    const target = $('account-balances'); target.replaceChildren();
+    for (const kind of ['asset', 'liability']) {
+      target.append(node('h3', '', kind === 'asset' ? '資産' : '負債'));
+      const table = node('table', 'account-table'), head = node('thead'), tr = node('tr'), body = node('tbody');
+      ['項目', '残高・評価額', '操作'].forEach(label => { const th = node('th', '', label); th.scope = 'col'; tr.append(th); }); head.append(tr);
+      data.accounts.filter(a => a.kind === kind).forEach(account => {
+        const row = node('tr'); row.dataset.account = account.account_id;
+        const action = node('td'), button = node('button', 'secondary small', '変更'); button.type = 'button'; button.disabled = account.amount === null;
+        button.addEventListener('click', () => openBalance(account)); action.append(button);
+        row.append(node('td', '', account.name), node('td', '', account.amount === null ? '未登録' : yen(account.amount)), action); body.append(row);
+      }); table.append(head, body); target.append(table);
+    }
+  }
+  function renderAssetTrend(months) {
+    const target = $('assets-chart'); target.replaceChildren();
+    const known = months.filter(m => m.known);
+    if (!known.length) target.append(node('p', 'empty', '表示期間の残高は未登録です。'));
+    else {
+      const keys = ['assets', 'liabilities', 'netAssets'], chartColors = ['#36765a', '#b04436', '#557da5'];
+      const amounts = known.flatMap(m => keys.map(k => m[k])), high = Math.max(1, ...amounts), low = Math.min(0, ...amounts);
+      const chart = svg('svg', { viewBox: '0 0 620 270', class: 'assets-line-chart', role: 'img', 'aria-label': '資産・負債・純資産の12か月推移。月ごとの金額は下の表で確認できます。' });
+      const x = index => 85 + index * 47, y = value => 30 + (high - value) / (high - low) * 175;
+      for (let i = 0; i <= 4; i++) {
+        const value = high - (high - low) * i / 4, pos = y(value);
+        chart.append(svg('line', { x1: 85, x2: 602, y1: pos, y2: pos, stroke: '#e3e8df' }));
+        const label = Math.abs(value) >= 100000000 ? (value / 100000000).toFixed(1) + '億' : Math.abs(value) >= 10000 ? (value / 10000).toFixed(1) + '万' : number(Math.round(value));
+        chart.append(svg('text', { x: 76, y: pos + 4, 'text-anchor': 'end', 'font-size': 11, fill: '#758279' }, label));
+      }
+      chart.append(svg('text', { x: 10, y: 16, 'font-size': 11, fill: '#758279' }, '円'));
+      keys.forEach((key, k) => {
+        let path = '', previous = false;
+        months.forEach((m, i) => {
+          if (!m.known) { previous = false; return; }
+          path += `${previous ? 'L' : 'M'}${x(i)},${y(m[key])} `; previous = true;
+          const point = svg('circle', { cx: x(i), cy: y(m[key]), r: 3, fill: chartColors[k] });
+          point.append(svg('title', {}, `${m.month} ${['資産', '負債', '純資産'][k]}：${yen(m[key])}`)); chart.append(point);
+        });
+        chart.append(svg('path', { d: path, fill: 'none', stroke: chartColors[k], 'stroke-width': 2 }));
+      });
+      months.forEach((m, i) => {
+        chart.append(svg('text', { x: x(i), y: 228, 'text-anchor': 'middle', 'font-size': 10, fill: '#758279' }, Number(m.month.slice(5)) + '月'));
+        if (i === 0 || m.month.endsWith('-01')) chart.append(svg('text', { x: x(i), y: 248, 'text-anchor': 'middle', 'font-size': 10, fill: '#758279' }, m.month.slice(0, 4)));
+      }); target.append(chart);
+    }
+    const table = node('table'), head = node('thead'), tr = node('tr'), body = node('tbody');
+    ['年月', '資産', '負債', '純資産'].forEach(label => { const th = node('th', '', label); th.scope = 'col'; tr.append(th); }); head.append(tr);
+    months.forEach(m => { const row = node('tr'); row.append(node('td', '', m.month), ...['assets', 'liabilities', 'netAssets'].map(key => node('td', '', m.known ? yen(m[key]) : '未登録'))); body.append(row); });
+    table.append(head, body); $('assets-trend-table').replaceChildren(table);
+  }
+  function renderMovements(data) {
+    const target = $('asset-movements'); target.replaceChildren();
+    $('movement-count').textContent = `${data.movementCount}件（直近50件を表示）`;
+    if (!data.movements.length) target.append(node('p', 'muted', '資産移動・返済の記録はありません。'));
+    const name = id => state.accounts.find(a => a.account_id === id)?.name || id;
+    data.movements.forEach(m => {
+      const row = node('div', 'asset-movement-row'), text = node('div');
+      text.append(node('small', '', m.date), node('span', '', `${name(m.from_account_id)} → ${name(m.to_account_id)}：${yen(m.amount)}`));
+      const remove = node('button', 'text-button delete-text', '削除'); remove.type = 'button';
+      remove.addEventListener('click', () => {
+        if (!assetCanOpen()) return;
+        state.deletion = { ...m, isMovement: true }; $('delete-description').textContent = `${m.date} / ${name(m.from_account_id)} → ${name(m.to_account_id)} / ${yen(m.amount)}`;
+        inline('delete-error', ''); $('delete-dialog').showModal();
+      }); row.append(text, remove); target.append(row);
+    });
+  }
+  async function loadAssets() {
+    const date = $('assets-date').value;
+    if (!date || !$('assets-date').checkValidity()) { inline('assets-error', '有効な残高表示日を選んでください。'); return; }
+    const seq = ++state.assetSeq; $('assets-content').setAttribute('aria-busy', 'true'); inline('assets-error', '');
+    ['total-assets', 'total-liabilities', 'total-net-assets'].forEach(id => $(id).textContent = '—');
+    $('account-balances').replaceChildren(); $('assets-chart').replaceChildren(); $('assets-trend-table').replaceChildren(); $('asset-movements').replaceChildren();
+    try {
+      const data = await rpc('getAssets', { date }); if (seq !== state.assetSeq) return;
+      state.assets = data; state.assetsInitialized = data.initialized;
+      const pendingInitial = state.pendingAsset?.form === 'initial';
+      $('assets-initial-form').hidden = data.initialized && !pendingInitial; $('assets-content').hidden = !data.initialized || pendingInitial;
+      $('asset-links-card').hidden = false;
+      if (data.initialized) {
+        $('total-assets').textContent = data.known ? yen(data.assets) : '未登録'; $('total-liabilities').textContent = data.known ? yen(data.liabilities) : '未登録'; $('total-net-assets').textContent = data.known ? yen(data.netAssets) : '未登録';
+        const warnings = [];
+        if (!data.known) warnings.push('表示日は開始残高の登録前です。');
+        if (data.unmappedTransactions) warnings.push(`反映先が未設定の取引が${data.unmappedTransactions}件あります。資産残高には含まれません。反映先を設定し、該当の取引を編集・保存してください。`);
+        if (data.accounts.some(a => a.amount !== null && a.amount < 0)) warnings.push('マイナス残高の項目があります。開始残高・取引・返済を確認してください。');
+        $('assets-warning').textContent = warnings.join(' '); $('assets-warning').hidden = !warnings.length;
+        $('open-movement').disabled = !data.known;
+        renderAccountBalances(data); renderAssetTrend(data.months); renderMovements(data);
+      }
+      assetControls();
+    } catch (error) { if (seq === state.assetSeq) inline('assets-error', error.message); }
+    finally { if (seq === state.assetSeq) $('assets-content').setAttribute('aria-busy', 'false'); }
+  }
+
   async function loadBootstrap() {
     const data = await rpc('getBootstrap');
     state.methods = data.paymentMethods; state.categories = data.categories;
+    state.accounts = data.accounts; state.paymentLinks = data.paymentLinks; state.assetsInitialized = data.assetsInitialized;
+    prepareInitialFields(); renderAssetLinks();
     renderEntryOptions(); renderHistoryCategories(); renderSettings(); updateEntryButton();
     return data;
   }
@@ -389,21 +615,23 @@
     const view = location.hash.slice(1);
     if (view === 'dashboard') await loadDashboard();
     if (view === 'history') await loadHistory(state.page);
+    if (view === 'assets') await loadAssets();
   }
   function navigate(view) {
-    if (!['entry', 'dashboard', 'history', 'settings'].includes(view)) view = 'entry';
+    if (!['entry', 'dashboard', 'history', 'settings', 'assets'].includes(view)) view = 'entry';
     if (location.hash !== '#' + view) location.hash = view;
     else showView();
   }
   function showView() {
     if (!state.ready) return;
     const requested = location.hash.slice(1);
-    const view = ['entry', 'dashboard', 'history', 'settings'].includes(requested) ? requested : 'entry';
+    const view = ['entry', 'dashboard', 'history', 'settings', 'assets'].includes(requested) ? requested : 'entry';
     document.querySelectorAll('.view').forEach(section => section.hidden = section.id !== view);
     document.querySelectorAll('[data-view]').forEach(link => { if (link.dataset.view === view) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
     if (view === 'dashboard') loadDashboard();
     if (view === 'history') loadHistory();
     if (view === 'settings') renderSettings();
+    if (view === 'assets') loadAssets();
     window.scrollTo({ top: 0 });
   }
   async function start() {
@@ -412,7 +640,10 @@
       await loadBootstrap(); state.ready = true;
       const today = todayTokyo(); $('entry-date').value = today;
       $('dashboard-month').value = today.slice(0, 7); $('history-month').value = today.slice(0, 7);
+      $('assets-date').value = today; $('assets-date').max = today; $('initial-date').value = today; $('initial-date').max = today;
       restoreEntry(storageRead(entryStorage)); updateEntryButton();
+      if (!state.assetsInitialized && !state.pendingEntry) location.hash = 'assets';
+      restoreAssetPending(storageRead(assetStorage));
       $('loading').hidden = true; showView();
       const pending = storageRead(masterStorage);
       if (pending?.payload && ['saveCategory', 'savePaymentMethod'].includes(pending.method)) {
@@ -431,18 +662,41 @@
   $('transaction-form').addEventListener('submit', saveEntry);
   $('transaction-form').addEventListener('input', updateEntryButton);
   $('transaction-form').addEventListener('change', updateEntryButton);
-  $('entry-amount').addEventListener('input', () => {
-    const input = $('entry-amount');
-    const value = amountValue();
-    const caret = input.selectionStart;
-    const remaining = input.value.length - caret;
-    if (Number.isSafeInteger(value) && value >= 0) {
-      input.value = number(value);
-      const newCaret = Math.max(0, input.value.length - remaining);
-      input.setSelectionRange(newCaret, newCaret);
-    }
-    input.setCustomValidity(input.value && (!Number.isSafeInteger(amountValue()) || amountValue() < 1) ? '1円以上の整数で入力してください。' : '');
-    updateEntryButton();
+  bindMoneyInput($('entry-amount'), 1);
+  bindMoneyInput($('balance-amount'));
+  bindMoneyInput($('movement-amount'), 1);
+  $('assets-date').addEventListener('change', loadAssets);
+  $('assets-refresh').addEventListener('click', loadAssets);
+  $('open-movement').addEventListener('click', openMovement);
+  $('assets-initial-form').addEventListener('submit', event => {
+    event.preventDefault();
+    if (state.pendingAsset?.form === 'initial') { assetSave('initializeAssets', 'initial'); return; }
+    const balances = {}; state.accounts.forEach(a => balances[a.account_id] = moneyValue($('initial-' + a.account_id)));
+    if (!Object.values(balances).every(value => Number.isSafeInteger(value) && value >= 0)) { inline('initial-error', 'すべての残高を0円以上の整数で入力してください。'); return; }
+    assetSave('initializeAssets', 'initial', { request_id: uuid(), date: $('initial-date').value, balances });
+  });
+  $('balance-form').addEventListener('submit', event => {
+    event.preventDefault();
+    if (state.pendingAsset?.form === 'balance') { assetSave('saveAssetBalances', 'balance'); return; }
+    const amount = moneyValue($('balance-amount'));
+    if (!Number.isSafeInteger(amount) || amount < 0) { inline('balance-error', '残高・評価額は0円以上の整数で入力してください。'); return; }
+    assetSave('saveAssetBalances', 'balance', { request_id: uuid(), date: $('balance-date').value, balances: { [state.balanceAccount.account_id]: amount }, expected_revision: state.balanceRevision });
+  });
+  $('movement-form').addEventListener('submit', event => {
+    event.preventDefault();
+    if (state.pendingAsset?.form === 'movement') { assetSave('createAssetMovement', 'movement'); return; }
+    const amount = moneyValue($('movement-amount'));
+    if (!Number.isSafeInteger(amount) || amount < 1) { inline('movement-error', '金額は1円以上の整数で入力してください。'); return; }
+    assetSave('createAssetMovement', 'movement', { request_id: uuid(), date: $('movement-date').value, from_account_id: $('movement-from').value, to_account_id: $('movement-to').value, amount });
+  });
+  $('link-form').addEventListener('submit', event => {
+    event.preventDefault();
+    if (state.pendingAsset?.form === 'link') { assetSave('savePaymentAccountLink', 'link'); return; }
+    assetSave('savePaymentAccountLink', 'link', { payment_method_id: state.linkMethod.payment_method_id, account_id: $('link-account').value, expected_updated_at: state.linkUpdatedAt });
+  });
+  ['balance', 'movement', 'link'].forEach(form => {
+    $('close-' + form).addEventListener('click', () => $(form + '-dialog').close());
+    $(form + '-dialog').addEventListener('cancel', event => { if (state.assetBusy || state.pendingAsset?.form === form) event.preventDefault(); });
   });
   $('cancel-edit').addEventListener('click', () => { resetEntry(); navigate('history'); });
   $('history-filters').addEventListener('submit', event => { event.preventDefault(); loadHistory(); });
@@ -466,7 +720,7 @@
   $('reload-app').addEventListener('click', start);
   window.addEventListener('hashchange', showView);
   window.addEventListener('beforeunload', event => {
-    if (state.pendingEntry || state.pendingMaster || state.deleteBusy) { event.preventDefault(); event.returnValue = ''; }
+    if (state.pendingEntry || state.pendingMaster || state.pendingAsset || state.deleteBusy) { event.preventDefault(); event.returnValue = ''; }
   });
   start();
 })();

@@ -15,7 +15,7 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function fixture(t, viewport = { width: 1280, height: 900 }) {
+async function fixture(t, viewport = { width: 1280, height: 900 }, initialize = true) {
   const server = spawn(process.execPath, ['scripts/dev.cjs'], { cwd: root, env: { ...process.env, PORT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => server.kill());
   const port = await new Promise((resolve, reject) => {
@@ -27,11 +27,18 @@ async function fixture(t, viewport = { width: 1280, height: 900 }) {
   const context = await browser.newContext({ viewport, timezoneId: 'America/Los_Angeles' });
   t.after(() => context.close());
   const page = await context.newPage();
+  if (initialize) {
+    const base = `http://127.0.0.1:${port}`;
+    const bootstrap = await (await context.request.post(base + '/rpc', { data: { method: 'getBootstrap' } })).json();
+    const balances = Object.fromEntries(bootstrap.data.accounts.map(a => [a.account_id, 0]));
+    const initialized = await (await context.request.post(base + '/rpc', { data: { method: 'initializeAssets', argument: { request_id: 'browser-opening01', date: '2024-01-01', balances } } })).json();
+    assert.equal(initialized.ok, true);
+  }
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   page.on('dialog', dialog => { if (dialog.type() === 'beforeunload') dialog.accept(); else { errors.push('Unexpected browser dialog: ' + dialog.type()); dialog.dismiss(); } });
   await page.goto(`http://127.0.0.1:${port}/`);
-  await page.locator('#entry').waitFor({ state: 'visible' });
+  await page.locator(initialize ? '#entry' : '#assets-initial-form').waitFor({ state: 'visible' });
   t.after(() => assert.deepEqual(errors, [], 'Browser JavaScript errors'));
   return { page, context, base: `http://127.0.0.1:${port}` };
 }
@@ -188,4 +195,81 @@ test('empty month renders zero totals, empty category state, and correct year-cr
   assert.match(await page.locator('#category-chart').textContent(), /データがありません/);
   const rows = page.locator('#trend-table tbody tr'); assert.equal(await rows.count(), 12); assert.match(await rows.first().textContent(), /^2025-02/); assert.match(await rows.last().textContent(), /^2026-01/);
   await history(page); assert.match(await page.locator('#history-list').textContent(), /記録はありません/);
+});
+
+async function assets(page, date = '2026-10-13') {
+  await go(page, 'assets'); await page.locator('#assets-date').fill(date); await page.locator('#assets-date').dispatchEvent('change');
+  await page.waitForFunction(() => document.querySelector('#assets-content').getAttribute('aria-busy') === 'false' && document.querySelector('#total-assets').textContent !== '—');
+}
+async function initialBalances(page, date = '2026-01-01') {
+  await page.locator('#initial-date').fill(date);
+  await page.locator('#initial-asset-cash').fill('10000'); await page.locator('#initial-asset-yucho').fill('100000');
+  await page.locator('#initial-asset-financial').fill('200000'); await page.locator('#initial-debt-jal-card').fill('2000');
+  await page.locator('#save-initial').click(); await page.locator('#assets-initial-form').waitFor({ state: 'hidden' });
+  await page.waitForFunction(() => document.querySelector('#assets-content').getAttribute('aria-busy') === 'false');
+}
+test('first use: opening assets/debts, auto cash/card reflection, repayment and dated valuation history', { timeout: 60000 }, async t => {
+  const { page } = await fixture(t, { width: 1280, height: 900 }, false);
+  assert.equal(await page.title(), 'セミナー会計　早瀬ユウカ監修　家計簿アプリ');
+  await initialBalances(page); await assets(page);
+  assert.equal(await page.locator('#total-assets').textContent(), '310,000円'); assert.equal(await page.locator('#total-liabilities').textContent(), '2,000円'); assert.equal(await page.locator('#total-net-assets').textContent(), '308,000円');
+  await go(page, 'entry'); await entry(page, { amount: '1000', date: '2026-01-02' }); await save(page);
+  await entry(page, { amount: '500', date: '2026-01-02' }); await page.locator('#entry-payment').selectOption({ label: 'クレジットカード（JALカード）' }); await save(page);
+  await assets(page); assert.equal(await page.locator('#total-assets').textContent(), '309,000円'); assert.equal(await page.locator('#total-liabilities').textContent(), '2,500円'); assert.equal(await page.locator('#total-net-assets').textContent(), '306,500円');
+  await page.locator('#open-movement').click(); await page.locator('#movement-date').fill('2026-01-03'); await page.locator('#movement-from').selectOption('asset-yucho'); await page.locator('#movement-to').selectOption('debt-jal-card'); await page.locator('#movement-amount').fill('2500'); await page.locator('#save-movement').click();
+  await page.locator('#movement-dialog').waitFor({ state: 'hidden' }); await page.waitForFunction(() => document.querySelector('#total-liabilities').textContent === '0円');
+  assert.equal(await page.locator('#total-assets').textContent(), '306,500円'); assert.equal(await page.locator('#total-net-assets').textContent(), '306,500円');
+  await page.locator('[data-account="asset-financial"] button').click(); await page.locator('#balance-date').fill('2026-03-31'); await page.locator('#balance-amount').fill('230000'); await page.locator('#save-balance').click();
+  await page.locator('#balance-dialog').waitFor({ state: 'hidden' }); await page.waitForFunction(() => document.querySelector('#total-net-assets').textContent === '336,500円');
+  await assets(page, '2026-02-28'); assert.match(await page.locator('[data-account="asset-financial"]').textContent(), /200,000円/);
+  await assets(page); assert.match(await page.locator('[data-account="asset-financial"]').textContent(), /230,000円/);
+  assert.equal(await page.locator('#assets-trend-table tbody tr').count(), 12);
+  await page.screenshot({ path: path.join(screenshots, 'desktop-assets.png'), fullPage: true });
+  await go(page, 'dashboard'); await month(page, '2026-01'); assert.equal(await page.locator('#summary-expense').textContent(), '1,500円');
+});
+
+test('sequential typing regroups every third digit, editing keeps digit position, UI contains only functional copy', { timeout: 40000 }, async t => {
+  const { page } = await fixture(t, { width: 375, height: 812 });
+  assert.equal(await page.locator('#entry-note').getAttribute('placeholder'), null);
+  const body = await page.locator('body').textContent(); assert.ok(!body.includes('¥')); assert.ok(!body.includes('小さな記録')); assert.ok(!body.includes('DAILY RECORD'));
+  await entry(page); const input = page.locator('#entry-amount'); await input.fill('');
+  const expected = ['1', '12', '123', '1,234', '12,345', '123,456', '1,234,567', '12,345,678', '123,456,789'];
+  for (let i = 0; i < expected.length; i++) { await input.press(String(i + 1)); assert.equal(await input.inputValue(), expected[i]); }
+  await input.press('Backspace'); assert.equal(await input.inputValue(), '12,345,678');
+  await input.fill('12345'); await input.evaluate(element => element.setSelectionRange(2, 2)); await input.press('9'); assert.equal(await input.inputValue(), '129,345');
+  await input.press('8'); assert.equal(await input.inputValue(), '1,298,345');
+  await assets(page); assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.setViewportSize({ width: 320, height: 740 }); assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.setViewportSize({ width: 375, height: 812 }); await page.screenshot({ path: path.join(screenshots, 'mobile-assets.png'), fullPage: true });
+});
+
+test('opening balance response loss survives reload without duplicate snapshots or lost input', { timeout: 40000 }, async t => {
+  const { page, context, base } = await fixture(t, { width: 375, height: 812 }, false);
+  let request;
+  await page.route('**/rpc', async route => {
+    const data = route.request().postDataJSON();
+    if (data.method === 'initializeAssets') { request = data.argument; await route.fetch(); await route.abort('failed'); }
+    else await route.continue();
+  });
+  await page.locator('#initial-asset-cash').fill(''); await page.locator('#initial-asset-cash').pressSequentially('1234567'); assert.equal(await page.locator('#initial-asset-cash').inputValue(), '1,234,567');
+  await page.locator('#save-initial').click(); await page.locator('#initial-pending').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#initial-asset-cash').isDisabled(), true);
+  await page.unroute('**/rpc'); await page.reload(); await page.locator('#initial-pending').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#initial-asset-cash').inputValue(), '1,234,567');
+  let retry; page.on('request', r => { if (r.url().endsWith('/rpc')) { const d = r.postDataJSON(); if (d.method === 'initializeAssets') retry = d.argument; } });
+  await page.locator('#save-initial').click(); await page.locator('#assets-initial-form').waitFor({ state: 'hidden' });
+  assert.equal(retry.request_id, request.request_id); assert.equal(await page.locator('#total-assets').textContent(), '1,234,567円');
+  const result = await (await context.request.post(base + '/rpc', { data: { method: 'getAssets' } })).json(); assert.equal(result.data.assets, 1234567);
+});
+
+test('asset movement deletion restores balances and mapping changes are saved through the asset tab', { timeout: 60000 }, async t => {
+  const { page } = await fixture(t, { width: 1280, height: 900 }, false); await initialBalances(page); await assets(page);
+  await page.locator('#open-movement').click(); await page.locator('#movement-date').fill('2026-01-03'); await page.locator('#movement-from').selectOption('asset-cash'); await page.locator('#movement-to').selectOption('asset-suica'); await page.locator('#movement-amount').fill('3000'); await page.locator('#save-movement').click();
+  await page.locator('#movement-dialog').waitFor({ state: 'hidden' }); await page.locator('[data-account="asset-suica"]').filter({ hasText: '3,000円' }).waitFor();
+  assert.equal(await page.locator('#total-assets').textContent(), '310,000円');
+  await page.locator('#asset-movements button').click(); await page.locator('#confirm-delete').click(); await page.locator('#delete-dialog').waitFor({ state: 'hidden' }); await page.locator('[data-account="asset-suica"]').filter({ hasText: '0円' }).waitFor();
+  await page.locator('#asset-links li').filter({ hasText: '現金' }).locator('button').click(); await page.locator('#link-account').selectOption('asset-paypay'); await page.locator('#save-link').click();
+  await page.locator('#link-dialog').waitFor({ state: 'hidden' }); await page.locator('#asset-links li').filter({ hasText: '現金' }).filter({ hasText: 'PayPay' }).waitFor();
+  await go(page, 'entry'); await entry(page, { amount: '500', date: '2026-01-04' }); assert.match(await page.locator('#entry-link-help').textContent(), /PayPay/); await save(page);
+  await assets(page); assert.match(await page.locator('[data-account="asset-cash"]').textContent(), /10,000円/); assert.match(await page.locator('[data-account="asset-paypay"]').textContent(), /-500円/);
 });
