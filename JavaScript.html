@@ -10,6 +10,11 @@
   const masterStorage = 'accounting1.pendingMaster.v1';
   const assetStorage = 'accounting1.pendingAsset.v1';
   Object.assign(state, { accounts: [], paymentLinks: [], assetsInitialized: false, assets: null, assetSeq: 0, assetBusy: false, pendingAsset: null, balanceAccount: null, linkMethod: null });
+  const saveMessages = {
+    expense: ['先生！使いすぎです！', '先生、こんなに何に使ったんですか！', 'はあ、私がちゃんと見ていないがばっかりに、、、'],
+    income: ['先生！よくがんばりましたね！', 'いつもありがとうございます、先生', 'こんなにいっぱい！でも、ちゃんと考えて使うんですよ？']
+  };
+  let saveMessageTimer = null;
 
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -29,6 +34,37 @@
     $('status').hidden = !text;
   }
   function inline(id, text) { $(id).textContent = text; $(id).hidden = !text; }
+  function positionSaveMessage() {
+    const nav = document.querySelector('.main-nav').getBoundingClientRect();
+    const offset = Math.max(0, window.innerHeight - nav.top);
+    $('save-message-card').style.setProperty('--save-message-nav-offset', offset + 'px');
+  }
+  function hideSaveMessage() {
+    if (saveMessageTimer !== null) clearTimeout(saveMessageTimer);
+    saveMessageTimer = null;
+    const card = $('save-message-card');
+    const hadFocus = card.contains(document.activeElement);
+    card.hidden = true;
+    $('save-message-text').textContent = '';
+    if (hadFocus) {
+      const view = document.querySelector('.view:not([hidden])');
+      const target = view?.querySelector('input:not(:disabled),button:not(:disabled),select:not(:disabled)') || document.querySelector('[data-view][aria-current="page"]');
+      target?.focus({ preventScroll: true });
+    }
+  }
+  function showSaveMessage(payload) {
+    const messages = saveMessages[payload.type];
+    const threshold = payload.type === 'expense' ? 10000 : 30000;
+    if (!messages || payload.amount < threshold) return;
+    hideSaveMessage();
+    const card = $('save-message-card');
+    card.classList.remove('expense', 'income');
+    card.classList.add(payload.type);
+    positionSaveMessage();
+    card.hidden = false;
+    $('save-message-text').textContent = messages[Math.floor(Math.random() * messages.length)];
+    saveMessageTimer = setTimeout(hideSaveMessage, 6000);
+  }
   function storageRead(key) { try { return JSON.parse(sessionStorage.getItem(key)); } catch (_) { return null; } }
   function storageWrite(key, value) {
     try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); }
@@ -180,15 +216,18 @@
       storageWrite(entryStorage, state.pendingEntry);
     }
     state.entryBusy = true;
+    hideSaveMessage();
     updateEntryButton();
     inline('entry-error', '');
     let saved = false;
-    const wasEdit = !!state.editing;
+    const submission = state.pendingEntry;
+    const wasEdit = submission.method === 'updateTransaction';
     try {
-      await rpc(state.pendingEntry.method, state.pendingEntry.payload);
+      await rpc(submission.method, submission.payload);
       saved = true;
       resetEntry();
       message(wasEdit ? '記録を更新しました。' : '記録しました。');
+      if (!wasEdit) showSaveMessage(submission.payload);
     } catch (error) {
       if (error.definitive) { state.pendingEntry = null; storageWrite(entryStorage, null); }
       inline('entry-error', error.message);
@@ -718,6 +757,9 @@
   $('delete-dialog').addEventListener('cancel', event => { if (state.deleteBusy) event.preventDefault(); });
   $('confirm-delete').addEventListener('click', confirmDelete);
   $('reload-app').addEventListener('click', start);
+  $('close-save-message').addEventListener('click', hideSaveMessage);
+  window.addEventListener('resize', positionSaveMessage);
+  if (globalThis.ResizeObserver) new ResizeObserver(positionSaveMessage).observe(document.querySelector('.main-nav'));
   window.addEventListener('hashchange', showView);
   window.addEventListener('beforeunload', event => {
     if (state.pendingEntry || state.pendingMaster || state.pendingAsset || state.deleteBusy) { event.preventDefault(); event.returnValue = ''; }

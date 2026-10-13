@@ -273,3 +273,155 @@ test('asset movement deletion restores balances and mapping changes are saved th
   await go(page, 'entry'); await entry(page, { amount: '500', date: '2026-01-04' }); assert.match(await page.locator('#entry-link-help').textContent(), /PayPay/); await save(page);
   await assets(page); assert.match(await page.locator('[data-account="asset-cash"]').textContent(), /10,000円/); assert.match(await page.locator('[data-account="asset-paypay"]').textContent(), /-500円/);
 });
+
+const saveMessages = {
+  expense: ['先生！使いすぎです！', '先生、こんなに何に使ったんですか！', 'はあ、私がちゃんと見ていないがばっかりに、、、'],
+  income: ['先生！よくがんばりましたね！', 'いつもありがとうございます、先生', 'こんなにいっぱい！でも、ちゃんと考えて使うんですよ？']
+};
+async function chooseSaveMessage(page, index) {
+  await page.evaluate(value => { Math.random = () => value; }, [0, 0.5, 0.999999][index]);
+}
+async function assertSaveMessage(page, type, index) {
+  const card = page.locator('#save-message-card');
+  await card.waitFor({ state: 'visible' });
+  assert.match(await card.textContent(), /保存しました/);
+  assert.equal(await page.locator('#save-message-text').textContent(), saveMessages[type][index]);
+  assert.equal(await card.evaluate((element, type) => element.classList.contains(type), type), true);
+  assert.equal(await card.evaluate((element, other) => element.classList.contains(other), type === 'expense' ? 'income' : 'expense'), false);
+}
+
+test('save message: inclusive thresholds and each of the three exact texts for expense and income', { timeout: 60000 }, async t => {
+  const { page } = await fixture(t);
+  const card = page.locator('#save-message-card');
+  assert.equal(await card.isVisible(), false);
+  for (const [type, amount] of [['expense', '9999'], ['income', '29999']]) {
+    await entry(page, { type, amount }); await save(page);
+    assert.equal(await card.isVisible(), false, `${type} below threshold`);
+  }
+  for (const type of ['expense', 'income']) {
+    const threshold = type === 'expense' ? 10000 : 30000;
+    for (let index = 0; index < 3; index++) {
+      await chooseSaveMessage(page, index);
+      await entry(page, { type, amount: String(threshold + index) }); await save(page);
+      await assertSaveMessage(page, type, index);
+    }
+  }
+  // A smaller new registration must dismiss the previous qualifying card.
+  await entry(page, { type: 'income', amount: '10000' }); await save(page);
+  assert.equal(await card.isVisible(), false);
+});
+
+test('save message: no premature or failure popup; lost-response retry displays after confirmed success without duplicate entry', { timeout: 40000 }, async t => {
+  const { page } = await fixture(t);
+  const card = page.locator('#save-message-card');
+  await entry(page, { type: 'income', amount: '30000', note: '次の保存前のメッセージ' }); await save(page);
+  await card.waitFor({ state: 'visible' });
+  const requests = [];
+  let releaseFailure, requestStarted;
+  const failureGate = new Promise(resolve => { releaseFailure = resolve; });
+  const started = new Promise(resolve => { requestStarted = resolve; });
+  await page.route('**/rpc', async route => {
+    const data = route.request().postDataJSON();
+    if (data.method !== 'createTransaction') return route.continue();
+    requests.push(data.argument);
+    requestStarted();
+    await failureGate;
+    await route.fulfill({ json: { ok: false, error: { code: 'VALIDATION', message: 'メッセージ検証用の保存失敗', retryable: false } } });
+  });
+  await chooseSaveMessage(page, 1);
+  await entry(page, { amount: '10000' }); await page.locator('#save-transaction').click(); await started;
+  assert.equal(await page.locator('#save-transaction').isDisabled(), true);
+  assert.equal(await card.isVisible(), false, 'The previous card disappears as soon as the next save starts');
+  releaseFailure();
+  await page.locator('#entry-error').filter({ hasText: 'メッセージ検証用の保存失敗' }).waitFor();
+  assert.equal(await card.isVisible(), false, 'No card on definitive failure');
+  assert.equal(await page.locator('#entry-amount').inputValue(), '10,000');
+  await page.unroute('**/rpc');
+  await page.route('**/rpc', async route => {
+    const data = route.request().postDataJSON();
+    if (data.method !== 'createTransaction') return route.continue();
+    requests.push(data.argument);
+    await route.fetch();
+    await route.abort('failed');
+  });
+  await page.locator('#save-transaction').click();
+  await page.locator('#pending-message').waitFor({ state: 'visible' });
+  assert.equal(await card.isVisible(), false, 'No card before the saved result is confirmed');
+  await page.unroute('**/rpc');
+  page.on('request', request => {
+    if (request.url().endsWith('/rpc')) { const data = request.postDataJSON(); if (data.method === 'createTransaction') requests.push(data.argument); }
+  });
+  await save(page); await assertSaveMessage(page, 'expense', 1);
+  assert.equal(requests.length, 3);
+  assert.equal(new Set(requests.map(request => request.request_id)).size, 1);
+  await history(page); assert.equal(await page.locator('#history-count').textContent(), '2件の記録');
+});
+
+test('save message: six-second lifetime, fresh timeout on replacement, manual close and continued entry focus', { timeout: 40000 }, async t => {
+  const { page } = await fixture(t);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.clock.install({ time: new Date('2026-10-13T00:00:00Z') });
+  await page.clock.pauseAt(new Date('2026-10-13T00:00:01Z'));
+  const card = page.locator('#save-message-card');
+  await chooseSaveMessage(page, 0);
+  await entry(page, { amount: '10000' }); await save(page); await assertSaveMessage(page, 'expense', 0);
+  assert.equal(await page.locator('dialog[open]').count(), 0);
+  assert.equal(await card.evaluate(element => element.contains(document.activeElement)), false, 'Showing the card must not steal focus');
+  await page.locator('#entry-amount').focus();
+  assert.equal(await page.locator('#entry-amount').evaluate(element => element === document.activeElement), true);
+  await page.clock.runFor(3000); assert.equal(await card.isVisible(), true);
+  await chooseSaveMessage(page, 2);
+  await entry(page, { type: 'income', amount: '30000' });
+  // Clear the previous status so save() waits for this registration's result.
+  await page.locator('#status').evaluate(element => { element.textContent = ''; });
+  await save(page); await assertSaveMessage(page, 'income', 2);
+  await page.locator('#entry-note').focus();
+  await page.clock.runFor(3000); assert.equal(await card.isVisible(), true, 'The old card timer must not close the replacement');
+  await page.clock.runFor(2999); assert.equal(await card.isVisible(), true);
+  await page.clock.runFor(1); assert.equal(await card.isVisible(), false, 'The replacement closes at six seconds');
+  assert.equal(await page.locator('#entry-note').evaluate(element => element === document.activeElement), true, 'Automatic dismissal keeps input focus');
+  await entry(page, { amount: '10000' });
+  await page.locator('#status').evaluate(element => { element.textContent = ''; });
+  await save(page); await card.waitFor({ state: 'visible' });
+  await page.locator('#close-save-message').click(); assert.equal(await card.isVisible(), false);
+  assert.equal(await card.evaluate(element => element.contains(document.activeElement)), false, 'Manual dismissal does not leave focus in a hidden card');
+});
+
+test('save message: mobile card stays within the screen above the navigation and leaves navigation usable', { timeout: 40000 }, async t => {
+  const { page } = await fixture(t, { width: 375, height: 812 });
+  await chooseSaveMessage(page, 2);
+  await entry(page, { amount: '10000' }); await save(page); await assertSaveMessage(page, 'expense', 2);
+  for (const viewport of [{ width: 375, height: 812 }, { width: 320, height: 640 }]) {
+    await page.setViewportSize(viewport);
+    const card = await page.locator('#save-message-card').boundingBox();
+    const nav = await page.locator('.main-nav').boundingBox();
+    assert.ok(card && nav);
+    assert.ok(card.x >= 0 && card.x + card.width <= viewport.width, 'Card fits horizontally');
+    assert.ok(card.y >= 0 && card.y + card.height < nav.y, 'Card remains above the menu without overlap');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  }
+  await go(page, 'history'); await page.locator('#history').waitFor({ state: 'visible' });
+  await go(page, 'entry');
+  await page.screenshot({ path: path.join(screenshots, 'mobile-save-message.png'), fullPage: true });
+});
+
+test('save message: editing, deletion, settings and asset balance saves do not display registration messages', { timeout: 60000 }, async t => {
+  const { page } = await fixture(t, { width: 1280, height: 900 }, false);
+  const card = page.locator('#save-message-card');
+  await initialBalances(page); assert.equal(await card.isVisible(), false, 'Opening balances are not income');
+  await go(page, 'entry'); await entry(page, { amount: '10000', note: 'メッセージ除外の検証' }); await save(page);
+  await card.waitFor({ state: 'visible' }); await page.locator('#close-save-message').click();
+  await history(page);
+  await page.locator('.transaction-row').filter({ hasText: 'メッセージ除外の検証' }).locator('button').filter({ hasText: '編集' }).click();
+  await page.locator('#entry-amount').fill('20000'); await save(page);
+  await page.locator('#history').waitFor({ state: 'visible' }); assert.equal(await card.isVisible(), false, 'No card for a qualifying edited amount');
+  await page.locator('.transaction-row').filter({ hasText: 'メッセージ除外の検証' }).locator('button').filter({ hasText: '削除' }).click();
+  await page.locator('#confirm-delete').click(); await page.locator('#status').filter({ hasText: '記録を削除しました' }).waitFor();
+  assert.equal(await card.isVisible(), false, 'No card for deletion');
+  await go(page, 'settings'); await page.locator('#category-settings li').filter({ hasText: '食費' }).locator('button').click();
+  await page.locator('#master-name').fill('食事'); await page.locator('#save-master').click(); await page.locator('#master-dialog').waitFor({ state: 'hidden' });
+  assert.equal(await card.isVisible(), false, 'No card for settings');
+  await assets(page); await page.locator('[data-account="asset-financial"] button').click();
+  await page.locator('#balance-amount').fill('50000'); await page.locator('#save-balance').click(); await page.locator('#balance-dialog').waitFor({ state: 'hidden' });
+  assert.equal(await card.isVisible(), false, 'A valuation change is not income');
+});
